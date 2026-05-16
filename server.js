@@ -256,6 +256,21 @@ app.post("/webhook", requireSecret, async (req, res) => {
 
     if (response.status === 202) {
       console.log("Email sent to:", email, "| Subject:", finalSubject);
+
+      // Notify Make for follow-up sequences
+      const makeUrl = "https://hook.us2.make.com/2f7zckyzjj1nus3qf8h8qgiubdndgibk";
+      fetch(makeUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          form_type:   formType,
+          email:       email,
+          first_name:  firstName,
+          promo_code:  promoCode,
+          submitted_at: new Date().toISOString(),
+        }),
+      }).catch(err => console.log("Make notification failed:", err.message));
+
       return res.json({ success: true, message: "Email sent.", formType, email });
     } else {
       const errorBody = await response.text();
