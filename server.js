@@ -45,6 +45,131 @@ function addUnsubscribe(email) {
   }
 }
 
+// ── Follow-up sequence store ──────────────────────────────────────────────────
+const FOLLOWUP_FILE = path.join("/tmp", "followups.json");
+
+function loadFollowups() {
+  try {
+    if (fs.existsSync(FOLLOWUP_FILE)) {
+      return JSON.parse(fs.readFileSync(FOLLOWUP_FILE, "utf8"));
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveFollowups(list) {
+  try {
+    fs.writeFileSync(FOLLOWUP_FILE, JSON.stringify(list), "utf8");
+  } catch (e) {
+    console.error("Failed to save followups:", e.message);
+  }
+}
+
+function addFollowup(email, firstName, formType) {
+  const list = loadFollowups();
+  // Don't add duplicates
+  const exists = list.some(f => f.email.toLowerCase() === email.toLowerCase());
+  if (!exists) {
+    list.push({
+      email:      email.toLowerCase(),
+      first_name: firstName,
+      form_type:  formType,
+      added_at:   new Date().toISOString(),
+      sent_day3:  false,
+      sent_day7:  false,
+      sent_day14: false,
+    });
+    saveFollowups(list);
+    console.log("Follow-up sequence started for:", email);
+  }
+}
+
+async function sendFollowupEmail(email, firstName, day) {
+  const apiKey = process.env.SENDGRID_API_KEY;
+  if (!apiKey) return;
+
+  if (isUnsubscribed(email)) {
+    console.log("Skipping follow-up for unsubscribed:", email);
+    return;
+  }
+
+  const name     = firstName || "";
+  const greeting = name ? "Hi " + name + "," : "Hi there,";
+  const unsub    = "\n\n---\nUnsubscribe: https://sidekix-email-server.onrender.com/unsubscribe?email=" + encodeURIComponent(email) + "\nSideKix - Character Limit LLC - Wilmington, NC";
+
+  let subject, body;
+
+  if (day === 3) {
+    subject = name ? name + ", still thinking about SideKix?" : "Still thinking about SideKix?";
+    body    = greeting + "\n\nJust checking in — it's been a few days since you reached out.\n\nWe'd love to help you get connected with the right advisor for your business. Whether you're just starting out or looking to scale, our network is ready for you.\n\nReady to take the next step? Visit sidekixhq.com to learn more.\n\nTalk soon,\nJames\nFounder, SideKix" + unsub;
+  } else if (day === 7) {
+    subject = "A quick note from SideKix";
+    body    = greeting + "\n\nI wanted to personally follow up and make sure you had everything you need.\n\nSideKix is built for entrepreneurs who are serious about growth — and we believe the right advisor can change everything.\n\nIf you have any questions or want to learn more about how it works, just reply to this email.\n\nAlways here,\nJames\nFounder, SideKix" + unsub;
+  } else if (day === 14) {
+    subject = "Last one from us, " + (name || "friend") + " — we mean it";
+    body    = greeting + "\n\nThis is the last email we'll send for now.\n\nThe people who get the most out of SideKix are the ones who decided to stop going it alone. If that ever sounds like you, we'll be at sidekixhq.com.\n\nWishing you the best,\nJames\nFounder, SideKix\n\nP.S. We don't delete your info — come back anytime." + unsub;
+  } else {
+    return;
+  }
+
+  try {
+    const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + apiKey,
+        "Content-Type":  "application/json",
+      },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email }] }],
+        from:     { email: "joinus@sidekixhq.com", name: "James at SideKix" },
+        reply_to: { email: "joinus@sidekixhq.com", name: "James at SideKix" },
+        subject,
+        content:  [{ type: "text/plain", value: body }],
+      }),
+    });
+
+    if (response.status === 202) {
+      console.log("Follow-up Day " + day + " sent to:", email);
+      return true;
+    } else {
+      const err = await response.text();
+      console.error("Follow-up send error:", err);
+      return false;
+    }
+  } catch (err) {
+    console.error("Follow-up fetch error:", err.message);
+    return false;
+  }
+}
+
+
+async function runFollowupScheduler() {
+  const list = loadFollowups();
+  const now  = new Date();
+  let updated = false;
+
+  for (const entry of list) {
+    const addedAt  = new Date(entry.added_at);
+    const daysSince = (now - addedAt) / (1000 * 60 * 60 * 24);
+
+    if (!entry.sent_day3 && daysSince >= 3) {
+      const ok = await sendFollowupEmail(entry.email, entry.first_name, 3);
+      if (ok) { entry.sent_day3 = true; updated = true; }
+    }
+    if (!entry.sent_day7 && daysSince >= 7) {
+      const ok = await sendFollowupEmail(entry.email, entry.first_name, 7);
+      if (ok) { entry.sent_day7 = true; updated = true; }
+    }
+    if (!entry.sent_day14 && daysSince >= 14) {
+      const ok = await sendFollowupEmail(entry.email, entry.first_name, 14);
+      if (ok) { entry.sent_day14 = true; updated = true; }
+    }
+  }
+
+  if (updated) saveFollowups(list);
+  console.log("Follow-up scheduler ran. Checked " + list.length + " entries.");
+}
+
 // ── Auth middleware ────────────────────────────────────────────────────────────
 function requireSecret(req, res, next) {
   const secret = req.headers["x-sidekix-secret"];
@@ -257,7 +382,10 @@ app.post("/webhook", requireSecret, async (req, res) => {
     if (response.status === 202) {
       console.log("Email sent to:", email, "| Subject:", finalSubject);
 
-      // Notify Make for follow-up sequences
+      // Add to follow-up sequence
+      addFollowup(email, firstName, formType);
+
+      // Notify Make
       const makeUrl = "https://hook.us2.make.com/2f7zckyzjj1nus3qf8h8qgiubdndgibk";
       fetch(makeUrl, {
         method: "POST",
@@ -282,6 +410,17 @@ app.post("/webhook", requireSecret, async (req, res) => {
   }
 });
 
+// ── View follow-up list (admin) ───────────────────────────────────────────────
+app.get("/followups", requireSecret, (req, res) => {
+  res.json({ success: true, followups: loadFollowups() });
+});
+
+// ── Manually trigger scheduler (admin) ────────────────────────────────────────
+app.post("/followups/run", requireSecret, async (req, res) => {
+  await runFollowupScheduler();
+  res.json({ success: true, message: "Scheduler ran." });
+});
+
 // ── Keep alive ─────────────────────────────────────────────────────────────────
 function keepAlive() {
   const url = process.env.RENDER_EXTERNAL_URL || "https://sidekix-email-server.onrender.com";
@@ -292,9 +431,20 @@ function keepAlive() {
   }, 4 * 60 * 1000);
 }
 
+// ── Follow-up scheduler — runs every 12 hours ─────────────────────────────────
+function startFollowupScheduler() {
+  // Run once on startup
+  runFollowupScheduler();
+  // Then every 12 hours
+  setInterval(() => {
+    runFollowupScheduler();
+  }, 12 * 60 * 60 * 1000);
+}
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("SideKix email server running on port " + PORT);
   keepAlive();
+  startFollowupScheduler();
 });
