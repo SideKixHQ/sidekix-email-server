@@ -42,12 +42,16 @@ app.post("/send-email", requireSecret, async (req, res) => {
     return res.status(400).json({ success: false, message: "Missing required fields: to, from, subject, body." });
   }
 
+  // Replace template variables
+  const finalBody    = body.replace(/{{email}}/g, to).replace(/{{first_name}}/g, to.split("@")[0]);
+  const finalSubject = subject.replace(/{{email}}/g, to).replace(/{{first_name}}/g, to.split("@")[0]);
+
   const payload = {
     personalizations: [{ to: [{ email: to }] }],
     from:     { email: from, name: fromName || "SideKix" },
     reply_to: { email: replyTo || from, name: fromName || "SideKix" },
-    subject,
-    content: [{ type: "text/plain", value: body }],
+    subject:  finalSubject,
+    content: [{ type: "text/plain", value: finalBody }],
   };
 
   // Add HTML version if provided
@@ -135,6 +139,10 @@ app.post("/webhook", requireSecret, async (req, res) => {
   }
 
   try {
+    // Replace template variables with actual values
+    const finalBody    = body.replace(/\{\{email\}\}/g, email).replace(/\{\{first_name\}\}/g, firstName).replace(/\{\{promo_code\}\}/g, promoCode);
+    const finalSubject = subject.replace(/\{\{email\}\}/g, email).replace(/\{\{first_name\}\}/g, firstName);
+
     const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: {
@@ -145,8 +153,8 @@ app.post("/webhook", requireSecret, async (req, res) => {
         personalizations: [{ to: [{ email }] }],
         from:     { email: from, name: fromName },
         reply_to: { email: from, name: fromName },
-        subject,
-        content:  [{ type: "text/plain", value: body }],
+        subject:  finalSubject,
+        content:  [{ type: "text/plain", value: finalBody }],
       }),
     });
 
