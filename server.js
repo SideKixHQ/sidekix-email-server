@@ -2,8 +2,15 @@ const express = require("express");
 const cors    = require("cors");
 const app     = express();
 
-app.use(cors());
+app.use(cors({
+  origin: "*",
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type","X-SideKix-Secret"],
+}));
 app.use(express.json());
+
+// Handle preflight OPTIONS requests
+app.options("*", cors());
 
 // ── Auth middleware ────────────────────────────────────────────────────────────
 // Every request must include header: X-SideKix-Secret: <your secret>
@@ -81,10 +88,11 @@ app.post("/webhook", requireSecret, async (req, res) => {
     return res.status(500).json({ success: false, message: "SendGrid API key not configured." });
   }
 
-  const data     = req.body;
-  const formType = data.form_type; // "application" | "subscriber" | "contact"
-  const email    = data.email;
+  const data      = req.body;
+  const formType  = data.form_type; // "application" | "subscriber" | "contact" | "waitlist"
+  const email     = data.email;
   const firstName = data.first_name || data.firstName || "there";
+  const promoCode = data.promo_code || "";
 
   if (!email || !formType) {
     return res.status(400).json({ success: false, message: "Missing email or form_type." });
@@ -93,23 +101,34 @@ app.post("/webhook", requireSecret, async (req, res) => {
   // Build email based on form type
   let from, fromName, subject, body;
 
+  // Use first name or friendly fallback
+  const name = firstName && firstName !== "there" ? firstName : "";
+  const greeting = name ? "Hi " + name + "," : "Hi there,";
+
   if (formType === "application") {
     from     = "Advisors@sidekixhq.com";
     fromName = "SideKix Advisors";
-    subject  = "We received your SideKix application, " + firstName + "!";
-    body     = "Hi " + firstName + ",\n\nThanks for applying to become a SideKix Advisor! We're excited to review your application.\n\nHere's what happens next:\n- Our team will review your application within 2-3 business days\n- You'll receive an email with next steps\n- In the meantime, feel free to explore sidekixhq.com\n\nTalk soon,\nThe SideKix Team\n\n---\nTo unsubscribe: https://sidekixhq.com/unsubscribe?email=" + email + "\nSideKix - Character Limit LLC - Wilmington, NC";
+    subject  = name ? "We received your SideKix application, " + name + "!" : "We received your SideKix application!";
+    body     = greeting + "\n\nThanks for applying to become a SideKix Advisor! We're excited to review your application.\n\nHere's what happens next:\n- Our team will review your application within 2-3 business days\n- You'll receive an email with next steps\n- In the meantime, feel free to explore sidekixhq.com\n\nTalk soon,\nThe SideKix Team\n\n---\nTo unsubscribe: https://sidekixhq.com/unsubscribe?email=" + email + "\nSideKix - Character Limit LLC - Wilmington, NC";
 
   } else if (formType === "subscriber") {
     from     = "joinus@sidekixhq.com";
     fromName = "SideKix";
-    subject  = "Welcome to SideKix, " + firstName;
-    body     = "Hi " + firstName + ",\n\nWelcome to SideKix! You're now on our list.\n\nWhat you can expect:\n- Insider tips on getting the most out of the platform\n- Early access to new features and advisors\n- Exclusive member-only content\n\nReady to get started? Visit sidekixhq.com/dashboard.\n\nTalk soon,\nThe SideKix Team\n\n---\nTo unsubscribe: https://sidekixhq.com/unsubscribe?email=" + email + "\nSideKix - Character Limit LLC - Wilmington, NC";
+    subject  = name ? "Welcome to SideKix, " + name + "!" : "Welcome to SideKix!";
+    body     = greeting + "\n\nWelcome to SideKix! You're now on our list.\n\nWhat you can expect:\n- Insider tips on getting the most out of the platform\n- Early access to new features and advisors\n- Exclusive member-only content\n\nReady to get started? Visit sidekixhq.com\n\nTalk soon,\nThe SideKix Team\n\n---\nTo unsubscribe: https://sidekixhq.com/unsubscribe?email=" + email + "\nSideKix - Character Limit LLC - Wilmington, NC";
+
+  } else if (formType === "waitlist") {
+    from     = "joinus@sidekixhq.com";
+    fromName = "SideKix";
+    subject  = name ? "You're on the SideKix waitlist, " + name + "!" : "You're on the SideKix waitlist!";
+    const promoLine = promoCode ? "\n\nYour exclusive promo code: " + promoCode + "\nUse it for early access pricing when we launch." : "\n\nAs a waitlist member, you'll get early access and our best launch pricing.";
+    body     = greeting + "\n\nYou're officially on the SideKix waitlist — and you're in good company.\n\nWe're building something that will change how entrepreneurs get support, and you'll be among the first to know when we launch." + promoLine + "\n\nStay tuned — big things are coming.\n\nJames\nFounder, SideKix\n\n---\nTo unsubscribe: https://sidekixhq.com/unsubscribe?email=" + email + "\nSideKix - Character Limit LLC - Wilmington, NC";
 
   } else if (formType === "contact") {
     from     = "joinus@sidekixhq.com";
     fromName = "SideKix";
     subject  = "Got your message — we'll be in touch soon";
-    body     = "Hi " + firstName + ",\n\nThanks for reaching out! We'll get back to you within 1 business day.\n\nTalk soon,\nThe SideKix Team\n\n---\nTo unsubscribe: https://sidekixhq.com/unsubscribe?email=" + email + "\nSideKix - Character Limit LLC - Wilmington, NC";
+    body     = greeting + "\n\nThanks for reaching out! We'll get back to you within 1 business day.\n\nTalk soon,\nThe SideKix Team\n\n---\nTo unsubscribe: https://sidekixhq.com/unsubscribe?email=" + email + "\nSideKix - Character Limit LLC - Wilmington, NC";
 
   } else {
     return res.status(400).json({ success: false, message: "Unknown form_type: " + formType });
