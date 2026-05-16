@@ -144,6 +144,19 @@ app.post("/webhook", requireSecret, async (req, res) => {
   }
 });
 
+// ── Keep alive — ping self every 4 minutes to prevent Render free tier sleep ───
+function keepAlive() {
+  const url = process.env.RENDER_EXTERNAL_URL || "https://sidekix-email-server.onrender.com";
+  setInterval(() => {
+    fetch(url)
+      .then(() => console.log("Keep-alive ping sent."))
+      .catch(err => console.log("Keep-alive ping failed:", err.message));
+  }, 4 * 60 * 1000);
+}
+
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("SideKix email server running on port " + PORT));
+app.listen(PORT, () => {
+  console.log("SideKix email server running on port " + PORT);
+  keepAlive();
+});
