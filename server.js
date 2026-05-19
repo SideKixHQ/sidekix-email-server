@@ -45,6 +45,75 @@ function addUnsubscribe(email) {
   }
 }
 
+// ── Contacts store (persisted to disk) ────────────────────────────────────────
+const CONTACTS_FILE = path.join("/tmp", "contacts.json");
+
+function loadContacts() {
+  try {
+    if (fs.existsSync(CONTACTS_FILE)) {
+      return JSON.parse(fs.readFileSync(CONTACTS_FILE, "utf8"));
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveContacts(list) {
+  try {
+    fs.writeFileSync(CONTACTS_FILE, JSON.stringify(list, null, 2), "utf8");
+  } catch (e) {
+    console.error("Failed to save contacts:", e.message);
+  }
+}
+
+function upsertContact(data) {
+  const list = loadContacts();
+  const email = (data.email || "").toLowerCase();
+  const idx = list.findIndex(c => c.email.toLowerCase() === email);
+  if (idx >= 0) {
+    // Update existing — always preserve review status and notes
+    const existing = list[idx];
+    list[idx] = {
+      ...existing,
+      ...data,
+      email,
+      // Never overwrite these with incoming form data
+      review:     existing.review     || "",
+      notes:      existing.notes      || "",
+      archived:   existing.archived   || false,
+      created_at: existing.created_at,
+      updated_at: new Date().toISOString(),
+    };
+  } else {
+    list.push({
+      id:           Date.now().toString(),
+      email,
+      first_name:   data.first_name  || data.firstName  || "",
+      last_name:    data.last_name   || data.lastName   || "",
+      phone:        data.phone       || "",
+      source:       data.source      || data.form_type  || "unknown",
+      status:       "active",
+      review:       data.source === "application" || data.form_type === "application" ? "Pending" : "",
+      tags:         data.tags        || [],
+      notes:        data.notes       || "",
+      expertise:    data.expertise   || "",
+      // Application fields
+      background:   data.background  || "",
+      strengths:    data.strengths   || "",
+      challenge:    data.challenge   || "",
+      why_sidekix:  data.why_sidekix || "",
+      linkedin:     data.linkedin    || "",
+      website:      data.website     || "",
+      city:         data.city        || "",
+      state:        data.state       || "",
+      archived:     false,
+      created_at:   new Date().toISOString(),
+      updated_at:   new Date().toISOString(),
+    });
+  }
+  saveContacts(list);
+  return list.find(c => c.email.toLowerCase() === email);
+}
+
 // ── Follow-up sequence store ──────────────────────────────────────────────────
 const FOLLOWUP_FILE = path.join("/tmp", "followups.json");
 
@@ -382,8 +451,30 @@ app.post("/webhook", requireSecret, async (req, res) => {
     if (response.status === 202) {
       console.log("Email sent to:", email, "| Subject:", finalSubject);
 
-      // Add to follow-up sequence
-      addFollowup(email, firstName, formType);
+      // Save contact to persistent store
+      upsertContact({
+        email,
+        first_name:  firstName,
+        last_name:   data.last_name   || data.lastName   || "",
+        phone:       data.phone       || "",
+        source:      formType,
+        form_type:   formType,
+        expertise:   data.expertise   || "",
+        background:  data.background  || "",
+        strengths:   data.strengths   || "",
+        challenge:   data.challenge   || "",
+        why_sidekix: data.why_sidekix || "",
+        linkedin:    data.linkedin    || "",
+        website:     data.website     || "",
+        city:        data.city        || "",
+        state:       data.state       || "",
+      });
+      console.log("Contact saved:", email, "| source:", formType);
+
+      // Add to follow-up sequence — skip advisor applicants
+      if (formType !== "application") {
+        addFollowup(email, firstName, formType);
+      }
 
       // Notify Make
       const makeUrl = "https://hook.us2.make.com/2f7zckyzjj1nus3qf8h8qgiubdndgibk";
@@ -408,6 +499,77 @@ app.post("/webhook", requireSecret, async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// ── Contacts CRUD ─────────────────────────────────────────────────────────────
+
+// GET all contacts
+app.get("/contacts", requireSecret, (req, res) => {
+  const contacts = loadContacts();
+  res.json({ success: true, contacts });
+});
+
+// POST create/upsert a contact manually
+app.post("/contacts", requireSecret, (req, res) => {
+  const data = req.body;
+  if (!data.email) return res.status(400).json({ success: false, message: "email required" });
+  const contact = upsertContact(data);
+  res.json({ success: true, contact });
+});
+
+// PATCH update a contact by id
+app.patch("/contacts/:id", requireSecret, (req, res) => {
+  const list = loadContacts();
+  const idx  = list.findIndex(c => c.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ success: false, message: "Contact not found" });
+  list[idx] = { ...list[idx], ...req.body, id: list[idx].id, updated_at: new Date().toISOString() };
+  saveContacts(list);
+  console.log("Contact updated:", list[idx].email, "| fields:", Object.keys(req.body).join(", "));
+  res.json({ success: true, contact: list[idx] });
+});
+
+// DELETE a contact by id
+app.delete("/contacts/:id", requireSecret, (req, res) => {
+  let list = loadContacts();
+  const contact = list.find(c => c.id === req.params.id);
+  if (!contact) return res.status(404).json({ success: false, message: "Contact not found" });
+  list = list.filter(c => c.id !== req.params.id);
+  saveContacts(list);
+  console.log("Contact deleted:", contact.email);
+  res.json({ success: true, message: "Deleted." });
+});
+
+// PATCH bulk update (for archive/status changes on multiple)
+app.patch("/contacts", requireSecret, (req, res) => {
+  const { ids, updates } = req.body;
+  if (!ids || !Array.isArray(ids) || !updates) {
+    return res.status(400).json({ success: false, message: "ids array and updates object required" });
+  }
+  const list = loadContacts();
+  let count = 0;
+  ids.forEach(id => {
+    const idx = list.findIndex(c => c.id === id);
+    if (idx >= 0) {
+      list[idx] = { ...list[idx], ...updates, id: list[idx].id, updated_at: new Date().toISOString() };
+      count++;
+    }
+  });
+  saveContacts(list);
+  res.json({ success: true, updated: count });
+});
+
+// DELETE bulk delete
+app.delete("/contacts", requireSecret, (req, res) => {
+  const { ids } = req.body;
+  if (!ids || !Array.isArray(ids)) {
+    return res.status(400).json({ success: false, message: "ids array required" });
+  }
+  let list = loadContacts();
+  const before = list.length;
+  list = list.filter(c => !ids.includes(c.id));
+  saveContacts(list);
+  console.log("Bulk deleted:", before - list.length, "contacts");
+  res.json({ success: true, deleted: before - list.length });
 });
 
 // ── View follow-up list (admin) ───────────────────────────────────────────────
