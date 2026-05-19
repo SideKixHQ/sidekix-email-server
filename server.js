@@ -6,7 +6,7 @@ const app     = express();
 
 app.use(cors({
   origin: "*",
-  methods: ["GET","POST","OPTIONS"],
+  methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","X-SideKix-Secret"],
 }));
 app.use(express.json());
@@ -509,20 +509,27 @@ app.post("/webhook", requireSecret, async (req, res) => {
       // Save contact to persistent store
       upsertContact({
         email,
-        first_name:  firstName,
-        last_name:   data.last_name   || data.lastName   || "",
-        phone:       data.phone       || "",
-        source:      formType,
-        form_type:   formType,
-        expertise:   data.expertise   || "",
-        background:  data.background  || "",
-        strengths:   data.strengths   || "",
-        challenge:   data.challenge   || "",
-        why_sidekix: data.why_sidekix || "",
-        linkedin:    data.linkedin    || "",
-        website:     data.website     || "",
-        city:        data.city        || "",
-        state:       data.state       || "",
+        first_name:     firstName,
+        last_name:      data.last_name      || data.lastName   || "",
+        phone:          data.phone          || "",
+        source:         formType,
+        form_type:      formType,
+        expertise:      data.expertise      || "",
+        background:     data.background     || "",
+        strengths:      data.strengths      || "",
+        challenge:      data.challenge      || "",
+        why_sidekix:    data.why_sidekix    || "",
+        linkedin:       data.linkedin       || "",
+        website:        data.website        || "",
+        city:           data.city           || "",
+        state:          data.state          || "",
+        zip_code:       data.zip_code       || "",
+        social_handles: data.social_handles || "",
+        years_owner:    data.years_owner    || "",
+        business_types: data.business_types || "",
+        prev_advisor:   data.prev_advisor   || "",
+        languages:      data.languages      || "",
+        resume_url:     data.resume_url     || "",
       });
       console.log("Contact saved:", email, "| source:", formType);
 
