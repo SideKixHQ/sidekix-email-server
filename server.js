@@ -45,6 +45,42 @@ function addUnsubscribe(email) {
   }
 }
 
+// ── Send log store ────────────────────────────────────────────────────────────
+const SENDLOG_FILE = path.join("/tmp", "sendlog.json");
+
+function loadSendLog() {
+  try {
+    if (fs.existsSync(SENDLOG_FILE)) {
+      return JSON.parse(fs.readFileSync(SENDLOG_FILE, "utf8"));
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveSendLog(list) {
+  try {
+    fs.writeFileSync(SENDLOG_FILE, JSON.stringify(list, null, 2), "utf8");
+  } catch (e) {
+    console.error("Failed to save send log:", e.message);
+  }
+}
+
+function appendSendLog(entry) {
+  const list = loadSendLog();
+  list.push({
+    id:          Date.now().toString() + Math.random().toString(36).slice(2,6),
+    ...entry,
+    time:        new Date().toLocaleString("en-US", { month:"short", day:"numeric", year:"numeric", hour:"numeric", minute:"2-digit" }),
+    sent_at:     new Date().toISOString(),
+    opened:      false,
+    clicked:     false,
+    unsubscribed:false,
+  });
+  // Keep last 1000 entries
+  if (list.length > 1000) list.splice(0, list.length - 1000);
+  saveSendLog(list);
+}
+
 // ── Contacts store (persisted to disk) ────────────────────────────────────────
 const CONTACTS_FILE = path.join("/tmp", "contacts.json");
 
@@ -80,6 +116,8 @@ function upsertContact(data) {
       review:     existing.review     || "",
       notes:      existing.notes      || "",
       archived:   existing.archived   || false,
+      // Preserve resume if new submission doesn't include one
+      resume_url: data.resume_url || existing.resume_url || "",
       created_at: existing.created_at,
       updated_at: new Date().toISOString(),
     };
@@ -105,6 +143,13 @@ function upsertContact(data) {
       website:      data.website     || "",
       city:         data.city        || "",
       state:        data.state       || "",
+      zip_code:     data.zip_code    || "",
+      social_handles: data.social_handles || "",
+      years_owner:  data.years_owner || "",
+      business_types: data.business_types || "",
+      prev_advisor: data.prev_advisor || "",
+      languages:    data.languages   || "",
+      resume_url:   data.resume_url  || "",
       archived:     false,
       created_at:   new Date().toISOString(),
       updated_at:   new Date().toISOString(),
@@ -359,6 +404,16 @@ app.post("/send-email", requireSecret, async (req, res) => {
 
     if (response.status === 202) {
       console.log("Email sent to:", to, "| Subject:", subject);
+      appendSendLog({
+        first_name: to.split("@")[0],
+        last_name:  "",
+        email:      to,
+        template:   subject.length > 40 ? subject.slice(0,40) + "…" : subject,
+        subject,
+        routed_to:  from,
+        log_type:   from.toLowerCase().includes("advisor") ? "advisor" : "subscriber",
+        status:     "delivered",
+      });
       return res.json({ success: true, message: "Email sent." });
     } else {
       const errorBody = await response.text();
@@ -471,6 +526,22 @@ app.post("/webhook", requireSecret, async (req, res) => {
       });
       console.log("Contact saved:", email, "| source:", formType);
 
+      // Append to send log
+      appendSendLog({
+        first_name: firstName,
+        last_name:  data.last_name || data.lastName || "",
+        email,
+        template:   formType === "application" ? "Application Received"
+                  : formType === "subscriber"  ? "Subscriber Welcome"
+                  : formType === "waitlist"    ? "Waitlist Confirmation"
+                  : formType === "contact"     ? "Contact Form Reply"
+                  : "Email",
+        subject:    finalSubject,
+        routed_to:  from,
+        log_type:   formType === "application" ? "advisor" : "subscriber",
+        status:     "delivered",
+      });
+
       // Add to follow-up sequence — skip advisor applicants
       if (formType !== "application") {
         addFollowup(email, firstName, formType);
@@ -499,6 +570,27 @@ app.post("/webhook", requireSecret, async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// ── Send log endpoints ────────────────────────────────────────────────────────
+app.get("/sendlog", requireSecret, (req, res) => {
+  res.json({ success: true, logs: loadSendLog() });
+});
+
+app.delete("/sendlog/:id", requireSecret, (req, res) => {
+  let list = loadSendLog();
+  list = list.filter(e => e.id !== req.params.id);
+  saveSendLog(list);
+  res.json({ success: true });
+});
+
+app.delete("/sendlog", requireSecret, (req, res) => {
+  const { ids } = req.body;
+  if (!ids || !Array.isArray(ids)) return res.status(400).json({ success:false, message:"ids required" });
+  let list = loadSendLog();
+  list = list.filter(e => !ids.includes(e.id));
+  saveSendLog(list);
+  res.json({ success: true, deleted: ids.length });
 });
 
 // ── Contacts CRUD ─────────────────────────────────────────────────────────────
