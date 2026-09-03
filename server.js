@@ -4,12 +4,29 @@ const fs      = require("fs");
 const path    = require("path");
 const app     = express();
 
+// Only these origins may call the API from a browser. Anything else is refused
+// at the CORS layer. Add new surfaces here rather than reopening this to "*".
+const ALLOWED_ORIGINS = [
+  "https://sidekixhq.com",
+  "https://www.sidekixhq.com",
+  "https://sidekixhq.github.io",
+  "http://localhost:3000",
+  "http://127.0.0.1:5500",
+];
+
 app.use(cors({
-  origin: "*",
+  origin: function (origin, cb) {
+    // no Origin header = server-to-server (curl, Render health check, Make)
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
+    // Refuse without throwing: the browser blocks the response because no CORS
+    // headers come back, and non-browser callers still hit the per-route guards.
+    return cb(null, false);
+  },
   methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
   allowedHeaders: ["Content-Type","X-SideKix-Secret"],
 }));
-app.use(express.json());
+app.use(express.json({ limit: "12mb" }));   // base64 CVs and photos ride in the body
 app.options("*", cors());
 
 // ── Unsubscribe list (persisted to disk) ──────────────────────────────────────
@@ -371,6 +388,13 @@ app.post("/send-email", requireSecret, async (req, res) => {
     return res.status(400).json({ success: false, message: "Missing required fields: to, from, subject, body." });
   }
 
+  // Without this the endpoint is an open relay: a caller could send mail as any
+  // address on a domain SendGrid has authenticated for us.
+  const ALLOWED_SENDERS = ["joinus@sidekixhq.com", "advisors@sidekixhq.com", "support@sidekixhq.com"];
+  if (!ALLOWED_SENDERS.includes(String(from).toLowerCase())) {
+    return res.status(400).json({ success: false, message: "Sender address not permitted." });
+  }
+
   // Block unsubscribed emails
   if (isUnsubscribed(to)) {
     console.log("Blocked send to unsubscribed email:", to);
@@ -480,6 +504,12 @@ app.post("/webhook", requireSecret, async (req, res) => {
     subject  = "Got your message — we'll be in touch soon";
     body     = greeting + "\n\nThanks for reaching out! We'll get back to you within 1 business day.\n\nTalk soon,\nThe SideKix Team" + unsub;
 
+  } else if (formType === "partner") {
+    from     = "joinus@sidekixhq.com";
+    fromName = "SideKix";
+    subject  = name ? "We got your partner enquiry, " + name : "We got your partner enquiry";
+    body     = greeting + "\n\nThanks for your interest in partnering with SideKix.\n\nWe read every enquiry ourselves. Someone will come back to you within 2 business days with next steps, or with questions if we need more detail.\n\nTalk soon,\nThe SideKix Team" + unsub;
+
   } else {
     return res.status(400).json({ success: false, message: "Unknown form_type: " + formType });
   }
@@ -577,6 +607,157 @@ app.post("/webhook", requireSecret, async (req, res) => {
   } catch (err) {
     return res.status(500).json({ success: false, message: err.message });
   }
+});
+
+// ── Public form endpoint ──────────────────────────────────────────────────────
+// The website is a static site, so it cannot hold the shared secret - anything
+// in its JavaScript is readable by anyone. This endpoint is therefore public,
+// but deliberately write-only: it can create a contact and trigger the standard
+// confirmation email, and it can do nothing else. It cannot read, delete, or
+// choose which address mail is sent from.
+//
+// Protection is three layers: the CORS allowlist above, a honeypot field that
+// real people never fill in, and a per-IP rate limit.
+
+const PUBLIC_FORM_TYPES = ["waitlist", "contact", "partner", "subscriber", "application"];
+const RATE = new Map();               // ip -> [timestamps]
+const RATE_MAX = 8;                   // submissions (shared office/home IPs)
+const RATE_WINDOW = 10 * 60 * 1000;   // per 10 minutes
+
+function rateLimited(ip) {
+  const now = Date.now();
+  const hits = (RATE.get(ip) || []).filter(t => now - t < RATE_WINDOW);
+  hits.push(now);
+  RATE.set(ip, hits);
+  if (RATE.size > 5000) RATE.clear();  // crude ceiling, this is in-memory only
+  return hits.length > RATE_MAX;
+}
+
+// Attachment limits. Files are never written to disk - they go straight out on
+// the notification email, because /tmp on Render is not storage.
+const MAX_FILES       = 2;
+const MAX_FILE_B64    = 6 * 1024 * 1024;
+const MAX_TOTAL_B64   = 9 * 1024 * 1024;
+
+function cleanAttachments(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  let total = 0;
+  for (const f of list.slice(0, MAX_FILES)) {
+    if (!f || typeof f.content !== "string" || !f.filename) continue;
+    if (f.content.length > MAX_FILE_B64) { console.log("Attachment too large, skipped:", f.filename); continue; }
+    total += f.content.length;
+    if (total > MAX_TOTAL_B64) { console.log("Attachment total exceeded, skipped:", f.filename); break; }
+    out.push({
+      content:     f.content,
+      filename:    String(f.filename).replace(/[^\w.\- ]/g, "_").slice(0, 120),
+      type:        String(f.type || "application/octet-stream").slice(0, 100),
+      disposition: "attachment",
+    });
+  }
+  return out;
+}
+
+async function notifyTeam(formType, email, fields, attachments) {
+  const apiKey = process.env.SENDGRID_API_KEY;
+  if (!apiKey) return;
+  const to = process.env.TEAM_NOTIFY_EMAIL || "joinus@sidekixhq.com";
+  const lines = Object.entries(fields)
+    .filter(([k, v]) => v !== "" && v != null && k !== "company_website")
+    .map(([k, v]) => k + ": " + (Array.isArray(v) ? v.join(", ") : v))
+    .join("\n");
+  // This doubles as the backup: contacts live in /tmp on Render and do not
+  // survive a restart, so every submission also lands in an inbox.
+  try {
+    await fetch("https://api.sendgrid.com/v3/mail/send", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        personalizations: [{ to: [{ email: to }] }],
+        from:     { email: "joinus@sidekixhq.com", name: "SideKix site" },
+        reply_to: { email: email, name: fields.first_name || email },
+        subject:  "New " + formType + " submission - " + email,
+        content:  [{ type: "text/plain", value: "New " + formType + " submission from the website.\n\n" + lines + "\n\nReceived " + new Date().toISOString() }],
+        ...(attachments && attachments.length ? { attachments } : {}),
+      }),
+    });
+  } catch (err) {
+    console.error("Team notification failed:", err.message);
+  }
+}
+
+app.post("/public/form", async (req, res) => {
+  const origin = req.headers.origin;
+  if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+    return res.status(403).json({ success: false, message: "Forbidden." });
+  }
+
+  const ip = (req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+  if (rateLimited(ip)) {
+    return res.status(429).json({ success: false, message: "Too many submissions. Please try again shortly." });
+  }
+
+  const d = req.body || {};
+
+  // Honeypot: a hidden field real users never see and never fill in.
+  if (d.company_website) {
+    console.log("Honeypot triggered, dropping submission from", ip);
+    return res.json({ success: true });   // look successful to the bot
+  }
+
+  const formType = String(d.form_type || "").toLowerCase();
+  const email    = String(d.email || "").trim().toLowerCase();
+
+  if (!PUBLIC_FORM_TYPES.includes(formType)) {
+    return res.status(400).json({ success: false, message: "Unknown form type." });
+  }
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]{2,}$/.test(email)) {
+    return res.status(400).json({ success: false, message: "Please enter a valid email address." });
+  }
+
+  const firstName = String(d.first_name || d.name || "").trim().slice(0, 80);
+
+  const files = cleanAttachments(d.attachments);
+
+  try {
+    upsertContact({
+      email,
+      first_name: firstName,
+      source:     formType,
+      linkedin:   String(d.linkedin   || "").slice(0, 200),
+      expertise:  String(d.expertise  || "").slice(0, 500),
+      background: String(d.background || "").slice(0, 500),
+      strengths:  String(d.strengths  || "").slice(0, 500),
+      languages:  String(d.languages  || "").slice(0, 200),
+      years_owner: String(d.years_owner || "").slice(0, 60),
+      business_types: String(d.business_types || "").slice(0, 300),
+      zip_code:   String(d.zip || d.zip_code || "").slice(0, 12),
+      website:    String(d.website || "").slice(0, 200),
+      notes:      String(d.details || d.message || d.offerings || "").slice(0, 6000),
+      tags:       formType === "partner" ? ["partner"] : [],
+    });
+  } catch (err) {
+    console.error("upsertContact failed:", err.message);
+  }
+
+  // Confirmation to the submitter, reusing the existing templates in /webhook.
+  let confirmed = false;
+  try {
+    const selfUrl = process.env.RENDER_EXTERNAL_URL || "http://127.0.0.1:" + (process.env.PORT || 3000);
+    const r = await fetch(selfUrl + "/webhook", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-SideKix-Secret": process.env.SIDEKIX_SECRET || "" },
+      body: JSON.stringify({ form_type: formType, email, first_name: firstName, promo_code: d.promo_code || "" }),
+    });
+    confirmed = r.ok;
+  } catch (err) {
+    console.error("Confirmation email failed:", err.message);
+  }
+
+  await notifyTeam(formType, email, d, files);
+
+  // The submission is recorded either way - never fail the visitor over email.
+  return res.json({ success: true, confirmed });
 });
 
 // ── Send log endpoints ────────────────────────────────────────────────────────
