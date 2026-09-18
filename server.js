@@ -188,139 +188,181 @@ function upsertContact(data) {
   return list.find(c => c.email.toLowerCase() === email);
 }
 
-// ── Follow-up sequence store ──────────────────────────────────────────────────
-const FOLLOWUP_FILE = path.join("/tmp", "followups.json");
+// ── Promo code store ──────────────────────────────────────────────────────────
+const PROMO_FILE = path.join("/tmp", "promocodes.json");
 
-function loadFollowups() {
+function loadPromoCodes() {
   try {
-    if (fs.existsSync(FOLLOWUP_FILE)) {
-      return JSON.parse(fs.readFileSync(FOLLOWUP_FILE, "utf8"));
-    }
+    if (fs.existsSync(PROMO_FILE)) return JSON.parse(fs.readFileSync(PROMO_FILE, "utf8"));
   } catch (e) {}
   return [];
 }
 
-function saveFollowups(list) {
+function savePromoCodes(list) {
   try {
-    fs.writeFileSync(FOLLOWUP_FILE, JSON.stringify(list), "utf8");
+    fs.writeFileSync(PROMO_FILE, JSON.stringify(list, null, 2), "utf8");
   } catch (e) {
-    console.error("Failed to save followups:", e.message);
+    console.error("Failed to save promo codes:", e.message);
   }
 }
 
-function addFollowup(email, firstName, formType) {
-  const list = loadFollowups();
-  // Don't add duplicates
-  const exists = list.some(f => f.email.toLowerCase() === email.toLowerCase());
-  if (!exists) {
-    list.push({
-      email:      email.toLowerCase(),
-      first_name: firstName,
-      form_type:  formType,
-      added_at:   new Date().toISOString(),
-      sent_day3:  false,
-      sent_day7:  false,
-      sent_day14: false,
-    });
-    saveFollowups(list);
-    console.log("Follow-up sequence started for:", email);
-  }
+function normaliseCode(v) {
+  return String(v || "").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "");
 }
 
-async function sendFollowupEmail(email, firstName, day) {
-  const apiKey = process.env.SENDGRID_API_KEY;
-  if (!apiKey) return;
+// One shape for a promo code, so the portal and the website agree on the fields.
+function shapePromoCode(input, existing) {
+  const base = existing || {};
+  const pick = (key, fallback) => (input[key] === undefined ? (base[key] !== undefined ? base[key] : fallback) : input[key]);
+  return {
+    id:            base.id || Date.now().toString() + Math.random().toString(36).slice(2, 6),
+    code:          normaliseCode(input.code || base.code),
+    type:          String(pick("type", "Discount")).slice(0, 40),
+    tier:          String(pick("tier", "Any tier")).slice(0, 40),
+    discount_type: String(pick("discount_type", "% off")).slice(0, 40),
+    value:         String(pick("value", "")).slice(0, 40),
+    campaign:      String(pick("campaign", "")).slice(0, 80),
+    notes:         String(pick("notes", "")).slice(0, 2000),
+    promo_msg:     String(pick("promo_msg", "")).slice(0, 500),
+    duration:      String(pick("duration", "One-time")).slice(0, 40),
+    starts:        String(pick("starts", "")).slice(0, 20),
+    expires:       String(pick("expires", "")).slice(0, 20),
+    single_use:    !!pick("single_use", false),
+    one_per_email: pick("one_per_email", true) !== false,
+    max_uses:      pick("max_uses", null) === null || pick("max_uses", null) === "" ? null : Number(pick("max_uses", null)),
+    active:        pick("active", true) !== false,
+    recipients:    Array.isArray(base.recipients)  ? base.recipients  : [],
+    redemptions:   Array.isArray(base.redemptions) ? base.redemptions : [],
+    created_at:    base.created_at || new Date().toISOString(),
+    updated_at:    new Date().toISOString(),
+  };
+}
 
-  if (isUnsubscribed(email)) {
-    console.log("Skipping follow-up for unsubscribed:", email);
-    return;
+function findPromoCode(code) {
+  const wanted = normaliseCode(code);
+  if (!wanted) return null;
+  return loadPromoCodes().find(c => c.code === wanted) || null;
+}
+
+// Why a code cannot be used right now, or null when it is usable.
+function promoRejection(entry, email) {
+  if (!entry)        return "That code was not recognised.";
+  if (!entry.active) return "That code is no longer active.";
+
+  const today = new Date().toISOString().slice(0, 10);
+  if (entry.starts  && today < entry.starts)  return "That code is not active yet.";
+  if (entry.expires && today > entry.expires) return "That code has expired.";
+
+  const used = entry.redemptions.length;
+  if (entry.max_uses !== null && used >= entry.max_uses) return "That code has reached its limit.";
+  if (entry.single_use && used >= 1)                     return "That code has already been used.";
+
+  if (entry.one_per_email && email) {
+    const seen = entry.redemptions.some(r => String(r.email || "").toLowerCase() === String(email).toLowerCase());
+    if (seen) return "That code has already been used on this email address.";
   }
+  return null;
+}
 
-  const name     = firstName || "";
-  const greeting = name ? "Hi " + name + "," : "Hi there,";
-  const unsub    = "\n\n---\nUnsubscribe: https://sidekix-email-server.onrender.com/unsubscribe?email=" + encodeURIComponent(email) + "\nSideKix - Character Limit LLC - Wilmington, NC";
+// What the website is allowed to see. Never the recipient list or the notes.
+function publicPromoView(entry) {
+  return {
+    code:          entry.code,
+    type:          entry.type,
+    tier:          entry.tier,
+    discount_type: entry.discount_type,
+    value:         entry.value,
+    duration:      entry.duration,
+    message:       entry.promo_msg,
+  };
+}
 
-  let subject, body;
+function recordRedemption(code, email) {
+  const list  = loadPromoCodes();
+  const idx   = list.findIndex(c => c.code === normaliseCode(code));
+  if (idx < 0) return false;
+  const entry = list[idx];
+  const addr  = String(email || "").toLowerCase();
 
-  if (day === 3) {
-    subject = name ? name + ", still thinking about SideKix?" : "Still thinking about SideKix?";
-    body    = greeting + "\n\nJust checking in — it's been a few days since you reached out.\n\nWe'd love to help you get connected with the right advisor for your business. Whether you're just starting out or looking to scale, our network is ready for you.\n\nReady to take the next step? Visit sidekixhq.com to learn more.\n\nTalk soon,\nJames\nFounder, SideKix" + unsub;
-  } else if (day === 7) {
-    subject = "A quick note from SideKix";
-    body    = greeting + "\n\nI wanted to personally follow up and make sure you had everything you need.\n\nSideKix is built for entrepreneurs who are serious about growth — and we believe the right advisor can change everything.\n\nIf you have any questions or want to learn more about how it works, just reply to this email.\n\nAlways here,\nJames\nFounder, SideKix" + unsub;
-  } else if (day === 14) {
-    subject = "Last one from us, " + (name || "friend") + " — we mean it";
-    body    = greeting + "\n\nThis is the last email we'll send for now.\n\nThe people who get the most out of SideKix are the ones who decided to stop going it alone. If that ever sounds like you, we'll be at sidekixhq.com.\n\nWishing you the best,\nJames\nFounder, SideKix\n\nP.S. We don't delete your info — come back anytime." + unsub;
-  } else {
-    return;
-  }
+  entry.redemptions.push({ email: addr, at: new Date().toISOString() });
+
+  // If this address was sent the code, move them along to redeemed.
+  const r = entry.recipients.find(x => String(x.email || "").toLowerCase() === addr);
+  if (r) { r.status = "redeemed"; r.redeemed_at = new Date().toISOString(); }
+
+  entry.updated_at = new Date().toISOString();
+  list[idx] = entry;
+  savePromoCodes(list);
+  console.log("Promo code redeemed:", entry.code, "by", addr);
+  return true;
+}
+
+// ── Auth ───────────────────────────────────────────────────────────────────────
+// Two ways in.
+//
+// 1. A Google ID token from a signed-in @sidekixhq.com account. This is how the
+//    Team Portal authenticates. Nothing secret ships in the portal's JavaScript,
+//    which matters because that file is public.
+// 2. The shared secret, kept for server-to-server callers: Make, and this
+//    server's own internal call to /webhook.
+const TEAM_DOMAIN  = "sidekixhq.com";
+const TOKEN_CACHE  = new Map();   // id token -> { email, exp }
+
+async function verifyGoogleToken(token) {
+  const cached = TOKEN_CACHE.get(token);
+  if (cached && cached.exp > Date.now()) return cached.email;
 
   try {
-    const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
-      method: "POST",
-      headers: {
-        "Authorization": "Bearer " + apiKey,
-        "Content-Type":  "application/json",
-      },
-      body: JSON.stringify({
-        personalizations: [{ to: [{ email }] }],
-        from:     { email: "joinus@sidekixhq.com", name: "James at SideKix" },
-        reply_to: { email: "joinus@sidekixhq.com", name: "James at SideKix" },
-        subject,
-        content:  [{ type: "text/plain", value: body }],
-      }),
-    });
+    const r = await fetch("https://oauth2.googleapis.com/tokeninfo?id_token=" + encodeURIComponent(token));
+    if (!r.ok) return null;
+    const d = await r.json();
 
-    if (response.status === 202) {
-      console.log("Follow-up Day " + day + " sent to:", email);
-      return true;
-    } else {
-      const err = await response.text();
-      console.error("Follow-up send error:", err);
-      return false;
-    }
+    // The token must have been issued for our own client, not somebody else's.
+    const expectedAud = process.env.GOOGLE_CLIENT_ID;
+    if (expectedAud && d.aud !== expectedAud) return null;
+
+    if (d.email_verified !== "true" && d.email_verified !== true) return null;
+
+    const email = String(d.email || "").toLowerCase();
+    if (!email.endsWith("@" + TEAM_DOMAIN)) return null;
+
+    // Cache until the token expires, capped at five minutes so a revoked
+    // account cannot keep working for long.
+    const exp = Math.min((Number(d.exp) || 0) * 1000, Date.now() + 5 * 60 * 1000);
+    if (TOKEN_CACHE.size > 500) TOKEN_CACHE.clear();
+    TOKEN_CACHE.set(token, { email, exp });
+    return email;
   } catch (err) {
-    console.error("Follow-up fetch error:", err.message);
-    return false;
+    console.error("Google token check failed:", err.message);
+    return null;
   }
 }
 
-
-async function runFollowupScheduler() {
-  const list = loadFollowups();
-  const now  = new Date();
-  let updated = false;
-
-  for (const entry of list) {
-    const addedAt  = new Date(entry.added_at);
-    const daysSince = (now - addedAt) / (1000 * 60 * 60 * 24);
-
-    if (!entry.sent_day3 && daysSince >= 3) {
-      const ok = await sendFollowupEmail(entry.email, entry.first_name, 3);
-      if (ok) { entry.sent_day3 = true; updated = true; }
-    }
-    if (!entry.sent_day7 && daysSince >= 7) {
-      const ok = await sendFollowupEmail(entry.email, entry.first_name, 7);
-      if (ok) { entry.sent_day7 = true; updated = true; }
-    }
-    if (!entry.sent_day14 && daysSince >= 14) {
-      const ok = await sendFollowupEmail(entry.email, entry.first_name, 14);
-      if (ok) { entry.sent_day14 = true; updated = true; }
-    }
-  }
-
-  if (updated) saveFollowups(list);
-  console.log("Follow-up scheduler ran. Checked " + list.length + " entries.");
-}
-
-// ── Auth middleware ────────────────────────────────────────────────────────────
+// Kept under the old name so every existing route keeps working unchanged.
 function requireSecret(req, res, next) {
-  const secret = req.headers["x-sidekix-secret"];
-  if (!secret || secret !== process.env.SIDEKIX_SECRET) {
-    return res.status(401).json({ success: false, message: "Unauthorized." });
+  const auth = req.headers["authorization"] || "";
+  if (auth.startsWith("Bearer ")) {
+    verifyGoogleToken(auth.slice(7).trim()).then(email => {
+      if (!email) return res.status(401).json({ success: false, message: "Sign in with a sidekixhq.com Google account." });
+      req.teamMember = email;
+      next();
+    });
+    return;
   }
-  next();
+
+  const secret = req.headers["x-sidekix-secret"];
+  if (secret && process.env.SIDEKIX_SECRET && secret === process.env.SIDEKIX_SECRET) {
+    req.teamMember = "service";
+    return next();
+  }
+
+  return res.status(401).json({ success: false, message: "Unauthorized." });
 }
+
+// Lets the portal confirm a sign-in before it shows anything.
+app.get("/me", requireSecret, (req, res) => {
+  res.json({ success: true, email: req.teamMember });
+});
 
 // ── Health check ───────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
@@ -591,11 +633,6 @@ app.post("/webhook", requireSecret, async (req, res) => {
         status:     "delivered",
       });
 
-      // Add to follow-up sequence — skip advisor applicants
-      if (formType !== "application") {
-        addFollowup(email, firstName, formType);
-      }
-
       // Notify Make
       const makeUrl = "https://hook.us2.make.com/2f7zckyzjj1nus3qf8h8qgiubdndgibk";
       fetch(makeUrl, {
@@ -810,6 +847,22 @@ app.post("/public/form", async (req, res) => {
     console.error("upsertContact failed:", err.message);
   }
 
+  // A promo code only counts as redeemed if it actually passes the checks. An
+  // expired or already-used code is dropped rather than repeated back to the
+  // visitor in their confirmation email as though it worked.
+  let promoCode   = "";
+  let promoReason = null;
+  if (d.promo_code) {
+    const entry = findPromoCode(d.promo_code);
+    promoReason = promoRejection(entry, email);
+    if (!promoReason) {
+      promoCode = entry.code;
+      recordRedemption(entry.code, email);
+    } else {
+      console.log("Promo code refused on submission:", d.promo_code, "-", promoReason);
+    }
+  }
+
   // Confirmation to the submitter, reusing the existing templates in /webhook.
   let confirmed = false;
   try {
@@ -817,7 +870,7 @@ app.post("/public/form", async (req, res) => {
     const r = await fetch(selfUrl + "/webhook", {
       method: "POST",
       headers: { "Content-Type": "application/json", "X-SideKix-Secret": process.env.SIDEKIX_SECRET || "" },
-      body: JSON.stringify({ form_type: formType, email, first_name: firstName, promo_code: d.promo_code || "" }),
+      body: JSON.stringify({ form_type: formType, email, first_name: firstName, promo_code: promoCode }),
     });
     confirmed = r.ok;
   } catch (err) {
@@ -827,7 +880,110 @@ app.post("/public/form", async (req, res) => {
   const notified = await notifyTeam(formType, email, d, files);
 
   // The submission is recorded either way - never fail the visitor over email.
-  return res.json({ success: true, confirmed, notified: notified.ok, notify_reason: notified.reason || null });
+  return res.json({
+    success: true,
+    confirmed,
+    notified: notified.ok,
+    notify_reason: notified.reason || null,
+    promo_applied: promoCode || null,
+    promo_message: promoReason,
+  });
+});
+
+// ── Promo codes (team only) ───────────────────────────────────────────────────
+app.get("/promocodes", requireSecret, (req, res) => {
+  res.json({ success: true, codes: loadPromoCodes() });
+});
+
+app.post("/promocodes", requireSecret, (req, res) => {
+  const code = normaliseCode(req.body && req.body.code);
+  if (!code) return res.status(400).json({ success: false, message: "A code is required." });
+
+  const list = loadPromoCodes();
+  if (list.some(c => c.code === code)) {
+    return res.status(409).json({ success: false, message: "That code already exists." });
+  }
+  const entry = shapePromoCode(req.body, null);
+  list.push(entry);
+  savePromoCodes(list);
+  console.log("Promo code created:", entry.code, "by", req.teamMember);
+  res.json({ success: true, code: entry });
+});
+
+app.patch("/promocodes/:id", requireSecret, (req, res) => {
+  const list = loadPromoCodes();
+  const idx  = list.findIndex(c => c.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ success: false, message: "Code not found." });
+
+  const next = shapePromoCode(req.body || {}, list[idx]);
+  // A rename must not collide with another code.
+  if (list.some((c, i) => i !== idx && c.code === next.code)) {
+    return res.status(409).json({ success: false, message: "Another code already uses that name." });
+  }
+  list[idx] = next;
+  savePromoCodes(list);
+  res.json({ success: true, code: next });
+});
+
+app.delete("/promocodes/:id", requireSecret, (req, res) => {
+  let list = loadPromoCodes();
+  const entry = list.find(c => c.id === req.params.id);
+  if (!entry) return res.status(404).json({ success: false, message: "Code not found." });
+  list = list.filter(c => c.id !== req.params.id);
+  savePromoCodes(list);
+  console.log("Promo code deleted:", entry.code, "by", req.teamMember);
+  res.json({ success: true });
+});
+
+// Record that a code was emailed to people, so the portal can show real numbers.
+app.post("/promocodes/:id/recipients", requireSecret, (req, res) => {
+  const list = loadPromoCodes();
+  const idx  = list.findIndex(c => c.id === req.params.id);
+  if (idx < 0) return res.status(404).json({ success: false, message: "Code not found." });
+
+  const incoming = Array.isArray(req.body && req.body.recipients) ? req.body.recipients : [];
+  const entry    = list[idx];
+  let added = 0;
+
+  for (const person of incoming.slice(0, 500)) {
+    const addr = String(person && person.email || "").trim().toLowerCase();
+    if (!addr) continue;
+    if (entry.recipients.some(r => String(r.email || "").toLowerCase() === addr)) continue;
+    entry.recipients.push({
+      email:  addr,
+      name:   String(person.name || "").slice(0, 120),
+      status: "sent",
+      date:   new Date().toISOString(),
+    });
+    added++;
+  }
+
+  entry.updated_at = new Date().toISOString();
+  list[idx] = entry;
+  savePromoCodes(list);
+  res.json({ success: true, added, code: entry });
+});
+
+// ── Promo codes (public, for the website) ─────────────────────────────────────
+// Read-only check. Tells the visitor whether a code works and what it gives
+// them, and nothing else about the code or who else has it.
+app.post("/public/promo/check", (req, res) => {
+  const origin = req.headers.origin;
+  if (!origin || !ALLOWED_ORIGINS.includes(origin)) {
+    return res.status(403).json({ success: false, message: "Forbidden." });
+  }
+
+  const ip = (req.headers["x-forwarded-for"] || req.ip || "").split(",")[0].trim();
+  if (rateLimited(ip)) {
+    return res.status(429).json({ valid: false, message: "Too many tries. Please wait a moment." });
+  }
+
+  const entry  = findPromoCode(req.body && req.body.code);
+  const email  = String(req.body && req.body.email || "").trim().toLowerCase();
+  const reason = promoRejection(entry, email);
+
+  if (reason) return res.json({ valid: false, message: reason });
+  return res.json({ valid: true, promo: publicPromoView(entry) });
 });
 
 // ── Send log endpoints ────────────────────────────────────────────────────────
@@ -922,17 +1078,6 @@ app.delete("/contacts", requireSecret, (req, res) => {
   res.json({ success: true, deleted: before - list.length });
 });
 
-// ── View follow-up list (admin) ───────────────────────────────────────────────
-app.get("/followups", requireSecret, (req, res) => {
-  res.json({ success: true, followups: loadFollowups() });
-});
-
-// ── Manually trigger scheduler (admin) ────────────────────────────────────────
-app.post("/followups/run", requireSecret, async (req, res) => {
-  await runFollowupScheduler();
-  res.json({ success: true, message: "Scheduler ran." });
-});
-
 // ── Keep alive ─────────────────────────────────────────────────────────────────
 function keepAlive() {
   const url = process.env.RENDER_EXTERNAL_URL || "https://sidekix-email-server.onrender.com";
@@ -943,20 +1088,9 @@ function keepAlive() {
   }, 4 * 60 * 1000);
 }
 
-// ── Follow-up scheduler — runs every 12 hours ─────────────────────────────────
-function startFollowupScheduler() {
-  // Run once on startup
-  runFollowupScheduler();
-  // Then every 12 hours
-  setInterval(() => {
-    runFollowupScheduler();
-  }, 12 * 60 * 60 * 1000);
-}
-
 // ── Start ──────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log("SideKix email server running on port " + PORT);
   keepAlive();
-  startFollowupScheduler();
 });
