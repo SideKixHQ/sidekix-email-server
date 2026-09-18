@@ -402,7 +402,7 @@ app.post("/send-email", requireSecret, async (req, res) => {
 
   // Without this the endpoint is an open relay: a caller could send mail as any
   // address on a domain SendGrid has authenticated for us.
-  const ALLOWED_SENDERS = ["joinus@sidekixhq.com", "advisors@sidekixhq.com", "support@sidekixhq.com"];
+  const ALLOWED_SENDERS = ["joinus@sidekixhq.com", "advisors@sidekixhq.com", "support@sidekixhq.com", "forms@sidekixhq.com"];
   if (!ALLOWED_SENDERS.includes(String(from).toLowerCase())) {
     return res.status(400).json({ success: false, message: "Sender address not permitted." });
   }
@@ -682,10 +682,10 @@ async function notifyTeam(formType, email, fields, attachments) {
 
   // Sent from a DIFFERENT address than it is delivered to. When both ends were
   // joinus@, Workspace treated it as mail from yourself arriving via an outside
-  // relay and filed it away. support@ is verified in SendGrid the same as
-  // joinus@, and the domain itself is authenticated, so any @sidekixhq.com
-  // address set in TEAM_FROM_EMAIL will send.
-  const fromAddress = String(process.env.TEAM_FROM_EMAIL || "support@sidekixhq.com").trim();
+  // relay and filed it away. sidekixhq.com is domain-authenticated in SendGrid,
+  // so any address on the domain can send. TEAM_FROM_EMAIL overrides this
+  // without another deploy.
+  const fromAddress = String(process.env.TEAM_FROM_EMAIL || "Forms@sidekixhq.com").trim();
 
   const subject = "New " + formType + " submission - " + email;
 
