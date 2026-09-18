@@ -24,7 +24,9 @@ app.use(cors({
     return cb(null, false);
   },
   methods: ["GET","POST","PATCH","DELETE","OPTIONS"],
-  allowedHeaders: ["Content-Type","X-SideKix-Secret"],
+  // Authorization carries the portal's Google ID token. Without it named here
+  // the browser refuses the preflight and the request never leaves the page.
+  allowedHeaders: ["Content-Type","Authorization","X-SideKix-Secret"],
 }));
 app.use(express.json({ limit: "12mb" }));   // base64 CVs and photos ride in the body
 app.options("*", cors());
