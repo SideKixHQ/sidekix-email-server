@@ -125,9 +125,21 @@ function upsertContact(data) {
   if (idx >= 0) {
     // Update existing — always preserve review status and notes
     const existing = list[idx];
+
+    // Only copy over values that actually carry something. A plain spread lets
+    // an incoming blank overwrite a stored value, which is how advisor
+    // applications were arriving complete and then being emptied a moment
+    // later by the confirmation call, leaving every field but the notes blank.
+    const incoming = {};
+    for (const [k, v] of Object.entries(data)) {
+      if (v === "" || v === null || v === undefined) continue;
+      if (Array.isArray(v) && v.length === 0) continue;
+      incoming[k] = v;
+    }
+
     list[idx] = {
       ...existing,
-      ...data,
+      ...incoming,
       email,
       // Never overwrite these with incoming form data
       review:     existing.review     || "",
@@ -660,31 +672,81 @@ function cleanAttachments(list) {
 
 async function notifyTeam(formType, email, fields, attachments) {
   const apiKey = process.env.SENDGRID_API_KEY;
-  if (!apiKey) return;
-  const to = process.env.TEAM_NOTIFY_EMAIL || "joinus@sidekixhq.com";
+
+  // Comma separated list is allowed, so a second address can be added in Render
+  // without touching this file again.
+  const recipients = String(process.env.TEAM_NOTIFY_EMAIL || "joinus@sidekixhq.com")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const subject = "New " + formType + " submission - " + email;
+
+  function record(status, error) {
+    try {
+      appendSendLog({
+        first_name: "Team notification",
+        last_name:  "",
+        email:      recipients.join(", "),
+        template:   "Team Notification",
+        subject:    subject,
+        routed_to:  recipients.join(", "),
+        log_type:   "team",
+        status:     status,
+        ...(error ? { error: error } : {}),
+      });
+    } catch (e) {
+      console.error("Failed to record team notification in send log:", e.message);
+    }
+  }
+
+  if (!apiKey) {
+    console.error("TEAM NOTIFY SKIPPED: SENDGRID_API_KEY is not set on this service.");
+    record("failed", "SENDGRID_API_KEY not set");
+    return { ok: false, reason: "no_api_key" };
+  }
+
   const lines = Object.entries(fields)
-    .filter(([k, v]) => v !== "" && v != null && k !== "company_website")
+    .filter(([k, v]) => v !== "" && v != null && k !== "company_website" && k !== "attachments")
     .map(([k, v]) => k + ": " + (Array.isArray(v) ? v.join(", ") : v))
     .join("\n");
+
   // This doubles as the backup: contacts live in /tmp on Render and do not
   // survive a restart, so every submission also lands in an inbox.
   try {
-    await fetch("https://api.sendgrid.com/v3/mail/send", {
+    const response = await fetch("https://api.sendgrid.com/v3/mail/send", {
       method: "POST",
       headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
       body: JSON.stringify({
-        personalizations: [{ to: [{ email: to }] }],
+        personalizations: [{ to: recipients.map(e => ({ email: e })) }],
         from:     { email: "joinus@sidekixhq.com", name: "SideKix site" },
         reply_to: { email: email, name: fields.first_name || email },
-        subject:  "New " + formType + " submission - " + email,
+        subject:  subject,
         content:  [{ type: "text/plain", value: "New " + formType + " submission from the website.\n\n" + lines + "\n\nReceived " + new Date().toISOString() }],
         ...(attachments && attachments.length ? { attachments } : {}),
       }),
     });
+
+    // SendGrid answers 202 on accept. Anything else is a refusal. Before this
+    // change the refusal was thrown away, which is why the failure was invisible.
+    if (response.status !== 202) {
+      const detail = await response.text().catch(() => "");
+      console.error("TEAM NOTIFY REFUSED by SendGrid:", response.status, detail.slice(0, 500));
+      record("failed", "SendGrid " + response.status + ": " + detail.slice(0, 300));
+      return { ok: false, reason: "sendgrid_" + response.status, detail: detail.slice(0, 300) };
+    }
+
+    console.log("Team notification sent to:", recipients.join(", "), "| Subject:", subject);
+    record("delivered");
+    return { ok: true };
+
   } catch (err) {
-    console.error("Team notification failed:", err.message);
+    console.error("TEAM NOTIFY FAILED (network):", err.message);
+    record("failed", "Network: " + err.message);
+    return { ok: false, reason: "network", detail: err.message };
   }
 }
+
 
 app.post("/public/form", async (req, res) => {
   const origin = req.headers.origin;
@@ -754,10 +816,10 @@ app.post("/public/form", async (req, res) => {
     console.error("Confirmation email failed:", err.message);
   }
 
-  await notifyTeam(formType, email, d, files);
+  const notified = await notifyTeam(formType, email, d, files);
 
   // The submission is recorded either way - never fail the visitor over email.
-  return res.json({ success: true, confirmed });
+  return res.json({ success: true, confirmed, notified: notified.ok, notify_reason: notified.reason || null });
 });
 
 // ── Send log endpoints ────────────────────────────────────────────────────────
