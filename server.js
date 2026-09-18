@@ -680,6 +680,13 @@ async function notifyTeam(formType, email, fields, attachments) {
     .map(s => s.trim())
     .filter(Boolean);
 
+  // Sent from a DIFFERENT address than it is delivered to. When both ends were
+  // joinus@, Workspace treated it as mail from yourself arriving via an outside
+  // relay and filed it away. support@ is verified in SendGrid the same as
+  // joinus@, and the domain itself is authenticated, so any @sidekixhq.com
+  // address set in TEAM_FROM_EMAIL will send.
+  const fromAddress = String(process.env.TEAM_FROM_EMAIL || "support@sidekixhq.com").trim();
+
   const subject = "New " + formType + " submission - " + email;
 
   function record(status, error) {
@@ -693,6 +700,7 @@ async function notifyTeam(formType, email, fields, attachments) {
         routed_to:  recipients.join(", "),
         log_type:   "team",
         status:     status,
+        sent_from:  fromAddress,
         ...(error ? { error: error } : {}),
       });
     } catch (e) {
@@ -719,7 +727,7 @@ async function notifyTeam(formType, email, fields, attachments) {
       headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
       body: JSON.stringify({
         personalizations: [{ to: recipients.map(e => ({ email: e })) }],
-        from:     { email: "joinus@sidekixhq.com", name: "SideKix site" },
+        from:     { email: fromAddress, name: "SideKix site" },
         reply_to: { email: email, name: fields.first_name || email },
         subject:  subject,
         content:  [{ type: "text/plain", value: "New " + formType + " submission from the website.\n\n" + lines + "\n\nReceived " + new Date().toISOString() }],
@@ -736,7 +744,7 @@ async function notifyTeam(formType, email, fields, attachments) {
       return { ok: false, reason: "sendgrid_" + response.status, detail: detail.slice(0, 300) };
     }
 
-    console.log("Team notification sent to:", recipients.join(", "), "| Subject:", subject);
+    console.log("Team notification sent from:", fromAddress, "to:", recipients.join(", "), "| Subject:", subject);
     record("delivered");
     return { ok: true };
 
