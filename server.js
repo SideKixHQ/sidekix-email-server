@@ -279,6 +279,35 @@ function publicPromoView(entry) {
   };
 }
 
+// Somebody was given a code, or arrived carrying one. This is not a use of the
+// code: a code is spent at checkout when money changes hands, not when someone
+// hands over an email address. Counting a waitlist signup as a redemption would
+// let a 50-use code exhaust itself before a single payment.
+function recordHolder(code, email, name) {
+  const list = loadPromoCodes();
+  const idx  = list.findIndex(c => c.code === normaliseCode(code));
+  if (idx < 0) return false;
+  const entry = list[idx];
+  const addr  = String(email || "").toLowerCase();
+  if (!addr) return false;
+
+  const already = entry.recipients.find(r => String(r.email || "").toLowerCase() === addr);
+  if (already) return true;
+
+  entry.recipients.push({
+    email:  addr,
+    name:   String(name || "").slice(0, 120),
+    status: "holding",
+    date:   new Date().toISOString(),
+  });
+  entry.updated_at = new Date().toISOString();
+  list[idx] = entry;
+  savePromoCodes(list);
+  console.log("Promo code issued to:", addr, "-", entry.code);
+  return true;
+}
+
+// Called when payment succeeds, never from a browser.
 function recordRedemption(code, email) {
   const list  = loadPromoCodes();
   const idx   = list.findIndex(c => c.code === normaliseCode(code));
@@ -849,17 +878,18 @@ app.post("/public/form", async (req, res) => {
     console.error("upsertContact failed:", err.message);
   }
 
-  // A promo code only counts as redeemed if it actually passes the checks. An
-  // expired or already-used code is dropped rather than repeated back to the
-  // visitor in their confirmation email as though it worked.
+  // A code carried in on a form is a code this person now holds, to spend at
+  // checkout later. It is checked for existence and validity so the
+  // confirmation email never repeats back a code that will not work, but it is
+  // not counted as used. That happens at payment.
   let promoCode   = "";
   let promoReason = null;
   if (d.promo_code) {
     const entry = findPromoCode(d.promo_code);
-    promoReason = promoRejection(entry, email);
+    promoReason = promoRejection(entry, null);   // no per-email check: nothing is being spent
     if (!promoReason) {
       promoCode = entry.code;
-      recordRedemption(entry.code, email);
+      recordHolder(entry.code, email, firstName);
     } else {
       console.log("Promo code refused on submission:", d.promo_code, "-", promoReason);
     }
@@ -887,7 +917,7 @@ app.post("/public/form", async (req, res) => {
     confirmed,
     notified: notified.ok,
     notify_reason: notified.reason || null,
-    promo_applied: promoCode || null,
+    promo_issued: promoCode || null,
     promo_message: promoReason,
   });
 });
@@ -964,6 +994,24 @@ app.post("/promocodes/:id/recipients", requireSecret, (req, res) => {
   list[idx] = entry;
   savePromoCodes(list);
   res.json({ success: true, added, code: entry });
+});
+
+// Redemption. Deliberately not public: a code is spent when payment succeeds,
+// and only the Stripe webhook on the website knows that. A browser calling this
+// could burn through a code without paying, so it needs the shared secret.
+app.post("/promocodes/redeem", requireSecret, (req, res) => {
+  const code  = normaliseCode(req.body && req.body.code);
+  const email = String(req.body && req.body.email || "").trim().toLowerCase();
+  if (!code)  return res.status(400).json({ success: false, message: "A code is required." });
+  if (!email) return res.status(400).json({ success: false, message: "An email is required." });
+
+  const entry  = findPromoCode(code);
+  const reason = promoRejection(entry, email);
+  if (reason) return res.status(409).json({ success: false, message: reason });
+
+  recordRedemption(code, email);
+  const after = findPromoCode(code);
+  res.json({ success: true, code: after.code, used: after.redemptions.length, max_uses: after.max_uses });
 });
 
 // ── Promo codes (public, for the website) ─────────────────────────────────────
